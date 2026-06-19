@@ -1,0 +1,10 @@
+{
+  "name": "jiseishin",
+  "version": "0.1.0",
+  "description": "A billing-accident guardrail that puts a self-limit on Claude Code's daily cost (converted at standard API rates) and blocks new prompts once the limit is reached",
+  "author": { "name": "rxnew" },
+  "homepage": "https://github.com/rxnew/jiseishin",
+  "repository": "https://github.com/rxnew/jiseishin",
+  "license": "MIT",
+  "keywords": ["usage", "limit", "guardrail", "cost", "budget", "tokens"]
+}

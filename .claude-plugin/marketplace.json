@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "jiseishin",
+  "description": "A marketplace distributing usage self-limit plugins for Claude Code",
+  "owner": {
+    "name": "rxnew"
+  },
+  "plugins": [
+    {
+      "name": "jiseishin",
+      "description": "A billing-accident guardrail that puts a self-limit on Claude Code's daily cost (converted at standard API rates) and blocks new prompts once the limit is reached",
+      "version": "0.1.0",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
