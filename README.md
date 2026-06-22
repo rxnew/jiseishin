@@ -94,11 +94,18 @@ It consists of [3 hooks](hooks/hooks.json) and [1 script](scripts/jiseishin.py).
 
 | hook | mode | role |
 |------|--------|------|
-| `Stop` (at each turn end) | `record` | Aggregates the current session's transcript and overwrites today's state file with that session's cumulative cost (USD) |
-| `UserPromptSubmit` (at submission) | `check` | Sums the values across all of today's sessions and, if at or above the limit, blocks the prompt with exit code 2 |
-| `PostToolBatch` (after each tool batch, before the next model call) | `guard` | Recomputes the live cumulative total mid-turn (reading only the bytes appended to the transcript since the last call) and, if at or above the limit, stops the agentic loop with exit code 2 |
+| `Stop` (at each turn end) | `record` | Folds the transcript lines appended since the last update into the main session's per-message records |
+| `UserPromptSubmit` (at submission) | `check` | Sums today's cost across all contexts and, if at or above the limit, blocks the prompt with exit code 2 |
+| `PostToolBatch` (after each tool batch, before the next model call) | `guard` | Folds in the lines appended since the last call (reading only the appended bytes) and, if today's total is at or above the limit, stops the agentic loop with exit code 2 |
 
-Each file stores a single execution context's cumulative cost (USD) at `~/.local/state/jiseishin/<YYYY-MM-DD>/<key>`, where `<key>` is the `session_id` for the main thread and `agent-<agent_id>` for a subagent. Subagents share the parent's `session_id` but each carries a distinct `agent_id`, and several can run in parallel (so `PostToolBatch` can fire concurrently); keying by `agent_id` gives every concurrent writer its own file, so no file is ever written by more than one process at a time and parallel writes cannot corrupt the state. The `guard` mode additionally keeps a per-context incremental-read cache (byte offset + partial sum) under `.../<YYYY-MM-DD>/.cache/<key>`.
+State lives under `~/.local/state/jiseishin/`, keyed by `<key>` (the `session_id` for the main thread, `agent-<agent_id>` for a subagent):
+
+- `days/<YYYY-MM-DD>/<key>.json` — a map of message id → cost (USD) for the responses that context billed on that day.
+- `cursors/<key>.json` — `{path, offset, prompt}`: how far that context's transcript has been read, plus the last human prompt (for the mid-turn exemption check).
+
+Subagents share the parent's `session_id` but each carries a distinct `agent_id`, and several can run in parallel (so `PostToolBatch` can fire concurrently); keying by `agent_id` gives every concurrent writer its own files, so no file is ever written by more than one process at a time and parallel writes cannot corrupt the state.
+
+The day's total reads **only that day's files** (`days/<that-day>/*`), **merging the maps and deduplicating by message id**, then summing — so it stays fast no matter how much history has accumulated. The dedup matters because when a session is resumed or forked, Claude Code writes a new transcript (new `session_id`) that copies the prior conversation verbatim — same message ids and timestamps, only `sessionId` rewritten. Summing each context's cost independently would count that shared history once per context (inflating the total several-fold); deduplicating by message id removes it, and attributing each response to the local date of its own timestamp keeps a resumed-from-an-earlier-day session from booking old cost on today. Because a copied message keeps its original timestamp, duplicates always fall on the same day, so per-day dedup suffices. This mirrors how tools like `ccusage` compute usage.
 
 ### Caveats
 
@@ -106,5 +113,24 @@ Each file stores a single execution context's cumulative cost (USD) at `~/.local
 - The mid-turn `guard` (`PostToolBatch`) fires after each tool batch, before the next model call, so an over-limit turn is stopped within itself, not only at the next submission. The residual overage is therefore at most **one model call's worth** — the call that pushed the total over the limit has already been billed by the time the hook sees it. With multiple sessions or parallel subagents running, the residual is bounded by "one model call's worth per running context."
 - A turn that makes **no tool calls** (a single large text response), or a single in-flight streaming response, cannot be interrupted partway; those cases are still caught at the next submission.
 - Subagent costs: when `PostToolBatch` fires inside a subagent, that subagent's own token cost is counted under `agent-<agent_id>` (more accurate than counting only the main transcript). A subagent's final message after its last tool batch is not aggregated (there is no `SubagentStop` recording), so it can be slightly undercounted.
-- Date boundaries follow the system's local date. The cost of a session that spans midnight is attributed to the date at update time.
+- Date boundaries follow the system's local date. Each response is attributed to the local date of its own transcript timestamp, so a session that spans midnight (or is resumed from an earlier day) has its cost split correctly across days rather than all booked on the update day.
 - If the guard itself errors, it **fails open** (lets the prompt through). This prevents a guard bug from making Claude completely unusable.
+
+## Development
+
+### Running the tests
+
+The tests use only the Python standard library (`unittest`), so no setup or dependencies are needed. Run them from the repository root:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Run a single test module or case with verbose output:
+
+```bash
+python3 -m unittest -v tests.test_jiseishin
+python3 -m unittest -v tests.test_jiseishin.CrossContextDedupTest
+```
+
+The tests point `STATE_ROOT` at a temporary directory and pin `TZ=UTC`, so they never touch your real state and are independent of the machine's timezone.

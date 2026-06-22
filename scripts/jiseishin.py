@@ -12,42 +12,53 @@ Scope is limited to Anthropic's standard API rates (pay-as-you-go). Batch
 
 There are 6 modes. The first 3 are called from hooks, the last 3 by hand:
 
-  record    : Called from the Stop hook. Aggregates the current session's
-              transcript and records "the session's cumulative cost (USD)"
-              into today's state file.
+  record    : Called from the Stop hook. Folds any transcript lines appended
+              since the last update into the main session's per-message records.
   check     : Called from the UserPromptSubmit hook. Blocks prompt submission
-              with exit code 2 if today's cumulative total across all sessions
+              with exit code 2 if today's cumulative total across all contexts
               is at or above the limit.
   guard     : Called from the PostToolBatch hook (after each tool batch, before
-              the next model call). Recomputes the live cumulative total
-              mid-turn and stops the agentic loop with exit code 2 if it is at
-              or above the limit, so a runaway loop is caught within the turn
-              instead of only at the next prompt.
+              the next model call). Folds in the lines appended since the last
+              call and stops the agentic loop with exit code 2 if today's total
+              is at or above the limit, so a runaway loop is caught within the
+              turn instead of only at the next prompt.
   set-limit : Saves the daily cost limit (USD) to the config file.
               Example: jiseishin.py set-limit 50
   status    : Shows the cost for a given day (today by default) and the
               current limit. Example: jiseishin.py status 2026-06-18
-  clear     : Deletes state files to reset the cumulative total. By default
-              only today's, or all days with --all.
+  clear     : Resets the cumulative total. By default only today's (other days
+              are kept), or every day with --all.
               Example: jiseishin.py clear / jiseishin.py clear --all
 
-State is stored as one cumulative-cost (USD) value per execution context at
-<state_root>/<YYYY-MM-DD>/<key>, where <key> is the session_id for the main
-thread and "agent-<agent_id>" for a subagent. Subagents share the parent's
-session_id but each carries a distinct agent_id and several can run in parallel,
-so keying by agent_id gives every concurrent writer its own file: no file is
-ever written by more than one process at a time, so parallel writes cannot
-corrupt state. The `guard` mode additionally keeps a per-context
-incremental-read cache (byte offset + partial sum) under
-<state_root>/<YYYY-MM-DD>/.cache/<key>, so each call scans only the bytes
-appended to the transcript since the previous call.
+State has two parts, both keyed by <key> = the session_id for the main thread
+or "agent-<agent_id>" for a subagent (so each concurrent writer owns its files
+and parallel writes never collide):
+
+  days/<YYYY-MM-DD>/<key>.json  : map of message id -> cost (USD) for the
+                                  responses that context billed on that day.
+  cursors/<key>.json            : {path, offset, prompt} — how far the
+                                  transcript has been read, plus the last human
+                                  prompt (used for the mid-turn exemption check).
+
+The day's total (date_cost) reads ONLY days/<that-day>/*, merging the maps and
+deduplicating by message id, then summing. Reading just one day keeps the cost
+bounded by that day's activity no matter how much history has accumulated.
+
+Two things this design handles, which a naive "sum each session's cost" would
+get wrong: when a session is resumed/forked, Claude Code writes a NEW transcript
+(new session_id) that copies the prior conversation verbatim (same message ids
+and timestamps, only sessionId is rewritten); merging by message id collapses
+those copies to one. And attributing each response to the local date of its own
+timestamp keeps a session that spans midnight (or is resumed from an earlier
+day) from booking old cost on today. Because a copied message keeps its original
+timestamp, duplicates always fall on the same day, so per-day dedup suffices.
 
 The limit is resolved in the order "env var JISEISHIN_MAX_DAILY_COST_USD >
 config file > default". The config file can be updated with `set-limit`, and
 changes take effect from the next prompt (unlike the env var, no restart of
 Claude Code is needed).
 To avoid the guard itself making Claude unusable, any unexpected error in the
-hooks (record/check) is swallowed and falls back to allowing the prompt
+hooks (record/check/guard) is swallowed and falls back to allowing the prompt
 (fail-open).
 
 Rates are the standard API rates (USD per 1M tokens). When prices change or a
@@ -74,9 +85,12 @@ CONFIG_PATH = os.path.join(
     "config.json",
 )
 
-# Subdirectory (under each day's state dir) holding guard's incremental-read
-# caches. The dotted name keeps it out of date_cost()'s "*" glob.
-CACHE_DIRNAME = ".cache"
+# Subdirectories under STATE_ROOT. Per-day message costs live in
+# days/<YYYY-MM-DD>/<key>.json (so a day's total reads only that day's files,
+# regardless of how much history has accumulated); per-context read cursors live
+# in cursors/<key>.json.
+DAYS_DIRNAME = "days"
+CURSORS_DIRNAME = "cursors"
 
 # Standard API rates (USD per 1M tokens). (input, output) per model family.
 # Versions within a family (Opus 4.5/4.6/4.7/4.8, etc.) share the same rate,
@@ -100,13 +114,21 @@ CACHE_WRITE_5M_MULTIPLIER = 1.25  # cache creation (5-minute TTL)
 CACHE_WRITE_1H_MULTIPLIER = 2.0   # cache creation (1-hour TTL)
 
 
-def state_dir(date):
-    """Return the state directory for a given day (<state_root>/<YYYY-MM-DD>)."""
-    return os.path.join(STATE_ROOT, date.isoformat())
+def day_dir(date_str):
+    """Directory holding per-context cost maps for one day."""
+    return os.path.join(STATE_ROOT, DAYS_DIRNAME, date_str)
 
 
-def today_dir():
-    return state_dir(datetime.date.today())
+def day_file(date_str, key):
+    return os.path.join(day_dir(date_str), key + ".json")
+
+
+def cursors_dir():
+    return os.path.join(STATE_ROOT, CURSORS_DIRNAME)
+
+
+def cursor_path(key):
+    return os.path.join(cursors_dir(), key + ".json")
 
 
 def read_config():
@@ -198,38 +220,51 @@ def usage_cost_usd(usage, model):
     return weighted / 1_000_000
 
 
-def sum_session_cost(transcript_path):
-    """Scan a transcript JSONL and sum the usage of assistant messages,
-    converting to USD at the per-model standard API rate.
+def message_date(obj):
+    """Return the local-date (YYYY-MM-DD) a transcript line should be billed on.
 
-    Claude Code writes one JSONL line per content block of an assistant
-    response (thinking / text / tool_use, ...), and every such line repeats the
-    SAME message.id and the SAME usage (the usage of the whole response). The
-    response is billed once, so each message.id is counted once; summing every
-    line would multiply a response's cost by its content-block count."""
-    total = 0.0
-    seen = set()
-    with open(transcript_path, "r", errors="replace") as fh:
-        for line in fh:
-            # Lightweight filter targeting only lines with usage (assistant
-            # messages). usage always includes output_tokens, so we test for it.
-            if "output_tokens" not in line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            message = obj.get("message") or {}
-            usage = message.get("usage") or {}
-            if not usage:
-                continue
-            message_id = message.get("id")
-            if message_id is not None:
-                if message_id in seen:
-                    continue
-                seen.add(message_id)
-            total += usage_cost_usd(usage, message.get("model"))
-    return total
+    Transcript timestamps are ISO-8601 UTC ("...Z"); we convert to the system's
+    local timezone so day boundaries match `datetime.date.today()` used
+    elsewhere. A missing/unparseable timestamp falls back to today so the cost
+    is still counted rather than silently dropped."""
+    ts = obj.get("timestamp")
+    if isinstance(ts, str) and ts:
+        try:
+            dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()  # -> local timezone
+            return dt.date().isoformat()
+        except Exception:
+            pass
+    return datetime.date.today().isoformat()
+
+
+def dedup_key(obj, message):
+    """A key identifying one billed response, stable across the content-block
+    lines that repeat it and across the transcript copies a resume/fork makes.
+
+    message.id is the response id and is repeated on every content-block line of
+    that response; requestId is its sibling. uuid is per-line (last resort, only
+    reached when a usage line carries neither id nor requestId, which does not
+    happen for normal assistant responses)."""
+    return message.get("id") or obj.get("requestId") or obj.get("uuid")
+
+
+def human_prompt_text(content):
+    """Return the text of a human prompt from a transcript user message, or None
+    if it is a tool-result turn (a list of tool_result blocks) rather than a
+    prompt the user actually typed."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        if any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
+            return None
+        text = "".join(
+            block.get("text", "") for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        return text or None
+    return None
 
 
 def context_key(data):
@@ -237,8 +272,8 @@ def context_key(data):
 
     Subagents share the parent's session_id but each carries a distinct
     agent_id, and several subagents can run in parallel. Keying by agent_id when
-    present (else session_id) gives every concurrent writer its own state and
-    cache file, so no file is ever written by more than one process at a time."""
+    present (else session_id) gives every concurrent writer its own state file,
+    so no file is ever written by more than one process at a time."""
     agent_id = data.get("agent_id")
     if agent_id:
         return "agent-" + str(agent_id)
@@ -250,11 +285,10 @@ def resolve_transcript(data):
 
     A hook firing inside a subagent is handed the PARENT session's
     transcript_path, not the subagent's own. Reading that parent under each
-    distinct agent_id key makes date_cost() sum the same parent transcript once
-    per parallel subagent (plus once under the main session's own key),
-    inflating the total by roughly the subagent count. So a subagent must read
-    its own transcript, which sits beside the parent at
-    <parent-without-.jsonl>/subagents/<context_key>.jsonl.
+    distinct agent_id key would re-read the parent once per parallel subagent.
+    Cross-context dedup by message id (see date_cost) would collapse those
+    re-reads, but a subagent should still read its OWN transcript, which sits
+    beside the parent at <parent-without-.jsonl>/subagents/<context_key>.jsonl.
 
     That layout is an observed Claude Code internal, not a documented hook
     contract, so it may change without notice; this is why we probe with
@@ -276,64 +310,54 @@ def resolve_transcript(data):
     if os.path.exists(own):
         return own
     # Own transcript not locatable: count NOTHING rather than re-reading the
-    # parent (that re-read is exactly the inflation this guards against).
+    # parent (that re-read would be collapsed by dedup, but reading it at all is
+    # pointless and risks miscounting under future layout changes).
     return None
 
 
-def human_prompt_text(content):
-    """Return the text of a human prompt from a transcript user message, or None
-    if it is a tool-result turn (a list of tool_result blocks) rather than a
-    prompt the user actually typed."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        if any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
-            return None
-        text = "".join(
-            block.get("text", "") for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-        return text or None
-    return None
-
-
-def cache_path(key):
-    return os.path.join(today_dir(), CACHE_DIRNAME, key)
-
-
-def incremental_session_cost(key, transcript_path):
-    """Return (cumulative_cost_usd, last_human_prompt) for a transcript, reading
-    only the bytes appended since the previous call.
-
-    The running byte offset, partial sum, last human prompt, and the set of
-    already-counted assistant message ids are cached per context under
-    <today>/.cache/<key>. Only this context writes that file, so parallel
-    subagents (distinct agent_id) never collide on it.
-
-    The seen-id set keeps this incremental path consistent with
-    sum_session_cost (see there): a response's content-block lines all repeat
-    one message.id and one usage, and those lines can straddle a call boundary,
-    so the set must persist across calls or a response would be recounted."""
+def load_json(path):
+    """Load a JSON object from path, or {} if missing/corrupt/not an object."""
     try:
-        with open(cache_path(key)) as fh:
-            cache = json.load(fh)
-        if not isinstance(cache, dict):
-            cache = {}
+        with open(path) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
     except Exception:
-        cache = {}
+        pass
+    return {}
 
-    if cache.get("path") == transcript_path:
-        offset = cache.get("offset", 0)
-        total = cache.get("sum", 0.0)
-        prompt = cache.get("prompt", "")
-        cached_seen = cache.get("seen")
-        seen = set(cached_seen) if isinstance(cached_seen, list) else set()
-    else:
-        offset, total, prompt, seen = 0, 0.0, "", set()
-    # Reset on a missing/rotated/truncated transcript (offset past EOF) so we
-    # never skip lines and undercount.
-    if not isinstance(offset, int) or offset < 0 or offset > os.path.getsize(transcript_path):
-        offset, total, prompt, seen = 0, 0.0, "", set()
+
+def update_context(key, transcript_path):
+    """Fold transcript lines appended since the last call into the per-day cost
+    maps for this context, persist them and the read cursor, and return the last
+    human prompt.
+
+    Each new assistant response is written to days/<its-date>/<key>.json as
+    message_id -> cost. Keying by message_id means the content-block lines that
+    repeat one response's id and usage are counted once, and the read cursor
+    (byte offset) means a line is processed only when its bytes are first read,
+    so a line straddling a call boundary is never recounted. Only this context
+    writes its own files, so parallel subagents (distinct agent_id) never
+    collide. A response is attributed to the local date of its own timestamp, so
+    its cost lands in the right day even for a session that spans midnight or is
+    resumed from an earlier day."""
+    cursor = load_json(cursor_path(key))
+    same_path = cursor.get("path") == transcript_path
+    offset = cursor.get("offset", 0) if same_path else 0
+    prompt = cursor.get("prompt", "") if same_path else ""
+
+    size = os.path.getsize(transcript_path)
+    # Re-scan from the top on a path change or a rotated/truncated transcript
+    # (offset past EOF) so we never skip lines and undercount. Drop this
+    # context's prior day-file entries first so the re-scan rebuilds them
+    # cleanly rather than leaving stale ids behind.
+    if not same_path or not isinstance(offset, int) or offset < 0 or offset > size:
+        offset, prompt = 0, ""
+        for stale in glob.glob(os.path.join(STATE_ROOT, DAYS_DIRNAME, "*", key + ".json")):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
 
     with open(transcript_path, "rb") as fh:
         fh.seek(offset)
@@ -341,6 +365,7 @@ def incremental_session_cost(key, transcript_path):
     # Consume only whole newline-terminated lines; a trailing partial line (one
     # still being written) is left for the next call.
     consumed = chunk.rfind(b"\n") + 1
+    costs_by_date = {}
     for raw in chunk[:consumed].splitlines():
         if not raw.strip():
             continue
@@ -351,47 +376,47 @@ def incremental_session_cost(key, transcript_path):
         message = obj.get("message") or {}
         usage = message.get("usage") or {}
         if usage:
-            message_id = message.get("id")
-            if message_id is not None:
-                if message_id in seen:
-                    continue
-                seen.add(message_id)
-            total += usage_cost_usd(usage, message.get("model"))
+            mkey = dedup_key(obj, message)
+            if mkey is not None:
+                costs_by_date.setdefault(message_date(obj), {})[mkey] = \
+                    usage_cost_usd(usage, message.get("model"))
         elif obj.get("type") == "user":
             text = human_prompt_text(message.get("content"))
             if text is not None:
                 prompt = text
 
-    record = {
-        "path": transcript_path,
-        "offset": offset + consumed,
-        "sum": total,
-        "prompt": prompt,
-        "seen": sorted(seen),
-    }
-    os.makedirs(os.path.dirname(cache_path(key)), exist_ok=True)
-    atomic_write(cache_path(key), json.dumps(record))
-    return total, prompt
+    for date_str, costs in costs_by_date.items():
+        merged = load_json(day_file(date_str, key))
+        merged.update(costs)
+        os.makedirs(day_dir(date_str), exist_ok=True)
+        atomic_write(day_file(date_str, key), json.dumps(merged))
+
+    os.makedirs(cursors_dir(), exist_ok=True)
+    atomic_write(cursor_path(key), json.dumps(
+        {"path": transcript_path, "offset": offset + consumed, "prompt": prompt}))
+    return prompt
 
 
 def date_cost(date):
-    """Sum the cumulative cost (USD) across all sessions for a given day."""
-    directory = state_dir(date)
-    total = 0.0
+    """Sum the cost (USD) billed on a given day, deduped across all contexts.
+
+    Reads only that day's files. The same message_id appears in several
+    contexts' files when a session is resumed/forked (the new transcript copies
+    prior messages, keeping their ids and timestamps); merging by id collapses
+    those copies to one. Duplicates always share the original timestamp, hence
+    the same day, so per-day dedup is sufficient."""
+    merged = {}
+    directory = day_dir(date.isoformat())
     if os.path.isdir(directory):
-        for path in glob.glob(os.path.join(directory, "*")):
-            if path.endswith(".tmp"):
-                continue
-            try:
-                with open(path) as fh:
-                    total += float(fh.read().strip() or 0)
-            except Exception:
-                continue
-    return total
+        for path in glob.glob(os.path.join(directory, "*.json")):
+            for mkey, cost in load_json(path).items():
+                if isinstance(cost, (int, float)):
+                    merged[mkey] = cost
+    return sum(merged.values())
 
 
 def today_cost():
-    """Sum the cumulative cost (USD) across all of today's sessions."""
+    """Sum the cost (USD) billed today, deduped across all contexts."""
     return date_cost(datetime.date.today())
 
 
@@ -410,14 +435,11 @@ def fmt_usd(amount):
 
 
 def cmd_record(data):
-    session_id = data.get("session_id")
-    transcript_path = data.get("transcript_path")
-    if not session_id or not transcript_path or not os.path.exists(transcript_path):
+    transcript_path = resolve_transcript(data)
+    key = context_key(data)
+    if not key or not transcript_path or not os.path.exists(transcript_path):
         return 0
-    total = sum_session_cost(transcript_path)
-    directory = today_dir()
-    os.makedirs(directory, exist_ok=True)
-    atomic_write(os.path.join(directory, session_id), repr(total))
+    update_context(key, transcript_path)
     return 0
 
 
@@ -428,9 +450,13 @@ def cmd_record(data):
 EXEMPT_COMMANDS = ("/jiseishin:set-limit", "/jiseishin:status", "/jiseishin:clear")
 
 
+def is_exempt(prompt):
+    prompt = (prompt or "").lstrip()
+    return any(prompt == cmd or prompt.startswith(cmd + " ") for cmd in EXEMPT_COMMANDS)
+
+
 def cmd_check(data):
-    prompt = (data.get("prompt") or "").lstrip()
-    if any(prompt == cmd or prompt.startswith(cmd + " ") for cmd in EXEMPT_COMMANDS):
+    if is_exempt(data.get("prompt")):
         return 0
     total = today_cost()
     threshold = limit()
@@ -456,17 +482,11 @@ def cmd_guard(data):
                 "skipping its cost this batch.\n"
             )
         return 0
-    cost, prompt = incremental_session_cost(key, transcript_path)
-    # Publish this context's live cost so parallel contexts and the check below
-    # see it (record only refreshes the main session's file at turn end).
-    directory = today_dir()
-    os.makedirs(directory, exist_ok=True)
-    atomic_write(os.path.join(directory, key), repr(cost))
+    prompt = update_context(key, transcript_path)
     # Honor the same exemptions as the submit-time check, so a turn started by a
     # recovery/inspection command can finish: read-only status, and raising the
     # limit or resetting the total, would otherwise be cut off mid-turn.
-    prompt = (prompt or "").lstrip()
-    if any(prompt == cmd or prompt.startswith(cmd + " ") for cmd in EXEMPT_COMMANDS):
+    if is_exempt(prompt):
         return 0
     total = today_cost()
     threshold = limit()
@@ -529,35 +549,48 @@ def cmd_status(args):
     return 0
 
 
-def cmd_clear(args):
-    """Delete state files to reset the cumulative total. By default only today's,
-    or all days with --all.
+def clear_today():
+    """Drop today's cost maps, keeping other days and every context's read
+    cursor.
 
-    Deleting today's state resets today's cumulative total to 0, and if a prompt
-    was blocked by hitting the limit, the next prompt will go through. However,
-    in-progress sessions are re-aggregated from the full transcript and written
-    back on the next Stop hook, so their costs reappear (costs from already-ended
-    sessions do not).
-    """
+    Keeping the cursors means an in-progress session does NOT re-count the
+    messages just cleared (they sit behind the byte offset) and only new
+    activity is added going forward — a clean "reset today, count fresh from
+    here". Returns the number of message records removed."""
+    directory = day_dir(datetime.date.today().isoformat())
+    if not os.path.isdir(directory):
+        return 0
+    removed = sum(len(load_json(path)) for path in glob.glob(os.path.join(directory, "*.json")))
+    shutil.rmtree(directory)
+    return removed
+
+
+def cmd_clear(args):
+    """Reset the cumulative total. By default only today's (other days kept), or
+    every day with --all (which also frees the on-disk state directory).
+
+    Resetting today sets today's total back to 0, and if a prompt was blocked by
+    hitting the limit, the next prompt goes through. In-progress sessions then
+    count only new usage from this point on (already-counted messages are not
+    re-added)."""
     extra = [arg for arg in args if arg != "--all"]
     if extra:
         sys.stderr.write("usage: jiseishin.py clear [--all]\n")
         return 1
 
     if "--all" in args:
-        target = STATE_ROOT
-        scope = "all days"
-    else:
-        target = today_dir()
-        scope = f"today ({datetime.date.today().isoformat()})"
-
-    if not os.path.isdir(target):
-        print(f"[jiseishin] No state files to delete ({scope}: {target})")
+        if not os.path.isdir(STATE_ROOT):
+            print(f"[jiseishin] No state files to delete (all days: {STATE_ROOT})")
+            return 0
+        file_count = sum(len(files) for _root, _dirs, files in os.walk(STATE_ROOT))
+        shutil.rmtree(STATE_ROOT)
+        print(f"[jiseishin] Deleted all state files ({file_count} file(s), {STATE_ROOT})")
         return 0
 
-    file_count = sum(len(files) for _root, _dirs, files in os.walk(target))
-    shutil.rmtree(target)
-    print(f"[jiseishin] Deleted state files for {scope} ({file_count} file(s), {target})")
+    today = datetime.date.today().isoformat()
+    removed = clear_today()
+    print(f"[jiseishin] Reset today's ({today}) cost: dropped {removed} message record(s). "
+          "In-progress sessions count only new usage from here.")
     return 0
 
 
