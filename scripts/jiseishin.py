@@ -238,9 +238,15 @@ def resolve_transcript(data):
     A hook firing inside a subagent is handed the PARENT session's
     transcript_path, not the subagent's own. Reading that parent under each
     distinct agent_id key makes date_cost() sum the same parent transcript once
-    per parallel subagent, inflating the total by ~N. So a subagent must read
+    per parallel subagent (plus once under the main session's own key),
+    inflating the total by roughly the subagent count. So a subagent must read
     its own transcript, which sits beside the parent at
     <parent-without-.jsonl>/subagents/<context_key>.jsonl.
+
+    That layout is an observed Claude Code internal, not a documented hook
+    contract, so it may change without notice; this is why we probe with
+    os.path.exists() below and fall back to counting nothing (never the parent)
+    rather than trusting the derived path blindly.
 
     The leaf is derived from context_key() so the state-file key (agent-<id>)
     and the transcript filename (agent-<id>.jsonl) can never drift apart."""
