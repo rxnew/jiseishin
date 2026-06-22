@@ -232,6 +232,35 @@ def context_key(data):
     return data.get("session_id")
 
 
+def resolve_transcript(data):
+    """Return the transcript whose cost belongs to THIS context.
+
+    A hook firing inside a subagent is handed the PARENT session's
+    transcript_path, not the subagent's own. Reading that parent under each
+    distinct agent_id key makes date_cost() sum the same parent transcript once
+    per parallel subagent, inflating the total by ~N. So a subagent must read
+    its own transcript, which sits beside the parent at
+    <parent-without-.jsonl>/subagents/<context_key>.jsonl.
+
+    The leaf is derived from context_key() so the state-file key (agent-<id>)
+    and the transcript filename (agent-<id>.jsonl) can never drift apart."""
+    path = data.get("transcript_path")
+    if not path:
+        return None
+    if not data.get("agent_id"):
+        return path  # main thread: the handed path is already its own
+    leaf = context_key(data) + ".jsonl"
+    if os.path.basename(path) == leaf:
+        return path  # forward-compat: a future version may hand the own path
+    base = path[:-len(".jsonl")] if path.endswith(".jsonl") else path
+    own = os.path.join(base, "subagents", leaf)
+    if os.path.exists(own):
+        return own
+    # Own transcript not locatable: count NOTHING rather than re-reading the
+    # parent (that re-read is exactly the inflation this guards against).
+    return None
+
+
 def human_prompt_text(content):
     """Return the text of a human prompt from a transcript user message, or None
     if it is a tool-result turn (a list of tool_result blocks) rather than a
@@ -378,9 +407,16 @@ def cmd_check(data):
 
 
 def cmd_guard(data):
-    transcript_path = data.get("transcript_path")
+    transcript_path = resolve_transcript(data)
     key = context_key(data)
     if not key or not transcript_path or not os.path.exists(transcript_path):
+        if data.get("agent_id") and not transcript_path:
+            # Surface layout drift rather than silently undercounting: we do NOT
+            # fall back to the parent transcript (that re-read is the bug).
+            sys.stderr.write(
+                f"[jiseishin] subagent transcript not found ({key}); "
+                "skipping its cost this batch.\n"
+            )
         return 0
     cost, prompt = incremental_session_cost(key, transcript_path)
     # Publish this context's live cost so parallel contexts and the check below
