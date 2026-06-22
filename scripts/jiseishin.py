@@ -200,8 +200,15 @@ def usage_cost_usd(usage, model):
 
 def sum_session_cost(transcript_path):
     """Scan a transcript JSONL and sum the usage of assistant messages,
-    converting to USD at the per-model standard API rate."""
+    converting to USD at the per-model standard API rate.
+
+    Claude Code writes one JSONL line per content block of an assistant
+    response (thinking / text / tool_use, ...), and every such line repeats the
+    SAME message.id and the SAME usage (the usage of the whole response). The
+    response is billed once, so each message.id is counted once; summing every
+    line would multiply a response's cost by its content-block count."""
     total = 0.0
+    seen = set()
     with open(transcript_path, "r", errors="replace") as fh:
         for line in fh:
             # Lightweight filter targeting only lines with usage (assistant
@@ -214,8 +221,14 @@ def sum_session_cost(transcript_path):
                 continue
             message = obj.get("message") or {}
             usage = message.get("usage") or {}
-            if usage:
-                total += usage_cost_usd(usage, message.get("model"))
+            if not usage:
+                continue
+            message_id = message.get("id")
+            if message_id is not None:
+                if message_id in seen:
+                    continue
+                seen.add(message_id)
+            total += usage_cost_usd(usage, message.get("model"))
     return total
 
 
@@ -292,9 +305,15 @@ def incremental_session_cost(key, transcript_path):
     """Return (cumulative_cost_usd, last_human_prompt) for a transcript, reading
     only the bytes appended since the previous call.
 
-    The running byte offset, partial sum, and last human prompt are cached per
-    context under <today>/.cache/<key>. Only this context writes that file, so
-    parallel subagents (distinct agent_id) never collide on it."""
+    The running byte offset, partial sum, last human prompt, and the set of
+    already-counted assistant message ids are cached per context under
+    <today>/.cache/<key>. Only this context writes that file, so parallel
+    subagents (distinct agent_id) never collide on it.
+
+    The seen-id set keeps this incremental path consistent with
+    sum_session_cost (see there): a response's content-block lines all repeat
+    one message.id and one usage, and those lines can straddle a call boundary,
+    so the set must persist across calls or a response would be recounted."""
     try:
         with open(cache_path(key)) as fh:
             cache = json.load(fh)
@@ -307,12 +326,14 @@ def incremental_session_cost(key, transcript_path):
         offset = cache.get("offset", 0)
         total = cache.get("sum", 0.0)
         prompt = cache.get("prompt", "")
+        cached_seen = cache.get("seen")
+        seen = set(cached_seen) if isinstance(cached_seen, list) else set()
     else:
-        offset, total, prompt = 0, 0.0, ""
+        offset, total, prompt, seen = 0, 0.0, "", set()
     # Reset on a missing/rotated/truncated transcript (offset past EOF) so we
     # never skip lines and undercount.
     if not isinstance(offset, int) or offset < 0 or offset > os.path.getsize(transcript_path):
-        offset, total, prompt = 0, 0.0, ""
+        offset, total, prompt, seen = 0, 0.0, "", set()
 
     with open(transcript_path, "rb") as fh:
         fh.seek(offset)
@@ -330,13 +351,24 @@ def incremental_session_cost(key, transcript_path):
         message = obj.get("message") or {}
         usage = message.get("usage") or {}
         if usage:
+            message_id = message.get("id")
+            if message_id is not None:
+                if message_id in seen:
+                    continue
+                seen.add(message_id)
             total += usage_cost_usd(usage, message.get("model"))
         elif obj.get("type") == "user":
             text = human_prompt_text(message.get("content"))
             if text is not None:
                 prompt = text
 
-    record = {"path": transcript_path, "offset": offset + consumed, "sum": total, "prompt": prompt}
+    record = {
+        "path": transcript_path,
+        "offset": offset + consumed,
+        "sum": total,
+        "prompt": prompt,
+        "seen": sorted(seen),
+    }
     os.makedirs(os.path.dirname(cache_path(key)), exist_ok=True)
     atomic_write(cache_path(key), json.dumps(record))
     return total, prompt
