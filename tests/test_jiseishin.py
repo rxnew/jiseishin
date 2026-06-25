@@ -274,6 +274,66 @@ class ClearTest(StateTestBase):
         self.assertFalse(os.path.isdir(j.STATE_ROOT))
 
 
+class TodayLimitOverrideTest(StateTestBase):
+    """Per-day limit overrides (set-today-limit): they win for their own day,
+    leave other days on the base limit, and self-expire."""
+    def setUp(self):
+        super().setUp()
+        self._orig_config = j.CONFIG_PATH
+        j.CONFIG_PATH = os.path.join(self.tmp, "config.json")
+
+    def tearDown(self):
+        j.CONFIG_PATH = self._orig_config
+        super().tearDown()
+
+    def test_override_applies_to_today_only(self):
+        j.cmd_set_limit(["10"])  # config base limit
+        self.assertEqual(j.limit(), 10.0)
+        self.assertEqual(j.cmd_set_today_limit(["150"]), 0)
+        self.assertEqual(j.limit(), 150.0)  # override wins over the config base
+        # Another day still uses the base limit.
+        self.assertEqual(j.limit(datetime.date(2026, 6, 19)), 10.0)
+
+    def test_env_var_wins_over_override(self):
+        j.cmd_set_today_limit(["150"])
+        os.environ["JISEISHIN_MAX_DAILY_COST_USD"] = "10"
+        try:
+            self.assertEqual(j.limit(), 10.0)  # env var is the hard ceiling
+        finally:
+            del os.environ["JISEISHIN_MAX_DAILY_COST_USD"]
+
+    def test_override_unblocks_check(self):
+        j.cmd_set_limit(["1"])  # config base limit
+        today = datetime.date.today().isoformat()
+        path = self.transcript("s")
+        write_transcript(path, [
+            asst_line("m1", timestamp=f"{today}T10:00:00.000Z", input_tokens=1_000_000),
+        ])
+        j.update_context("s", path)  # $5, over the $1 base limit
+        self.assertEqual(j.cmd_check({"prompt": "hi"}), 2)
+        self.assertEqual(j.cmd_set_today_limit(["50"]), 0)
+        self.assertEqual(j.cmd_check({"prompt": "hi"}), 0)  # raised for today
+
+    def test_set_today_limit_command_is_exempt(self):
+        self.assertTrue(j.is_exempt("/jiseishin:set-today-limit 50"))
+
+    def test_past_overrides_pruned_on_write(self):
+        # Seed an old override directly, then set today's; the old one is dropped.
+        j.cmd_set_limit(["100"])  # ensure config exists
+        config = j.read_config()
+        config["daily_limits"] = {"2020-01-01": 999}
+        j.atomic_write(j.CONFIG_PATH, json.dumps(config))
+        self.assertEqual(j.cmd_set_today_limit(["150"]), 0)
+        overrides = j.read_config()["daily_limits"]
+        self.assertNotIn("2020-01-01", overrides)
+        self.assertEqual(overrides[datetime.date.today().isoformat()], 150)
+
+    def test_invalid_value_rejected(self):
+        self.assertEqual(j.cmd_set_today_limit(["abc"]), 1)
+        self.assertEqual(j.cmd_set_today_limit(["-5"]), 1)
+        self.assertEqual(j.cmd_set_today_limit([]), 1)
+
+
 class HookFlowTest(StateTestBase):
     def _seed_today(self, key, cost_tokens):
         path = self.transcript(key)

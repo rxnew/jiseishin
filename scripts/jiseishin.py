@@ -10,25 +10,30 @@ the per-model rates are reflected.
 Scope is limited to Anthropic's standard API rates (pay-as-you-go). Batch
 (half price), priority tier, and subscription usage limits are out of scope.
 
-There are 6 modes. The first 3 are called from hooks, the last 3 by hand:
+There are 7 modes. The first 3 are called from hooks, the last 4 by hand:
 
-  record    : Called from the Stop hook. Folds any transcript lines appended
-              since the last update into the main session's per-message records.
-  check     : Called from the UserPromptSubmit hook. Blocks prompt submission
-              with exit code 2 if today's cumulative total across all contexts
-              is at or above the limit.
-  guard     : Called from the PostToolBatch hook (after each tool batch, before
-              the next model call). Folds in the lines appended since the last
-              call and stops the agentic loop with exit code 2 if today's total
-              is at or above the limit, so a runaway loop is caught within the
-              turn instead of only at the next prompt.
-  set-limit : Saves the daily cost limit (USD) to the config file.
-              Example: jiseishin.py set-limit 50
-  status    : Shows the cost for a given day (today by default) and the
-              current limit. Example: jiseishin.py status 2026-06-18
-  clear     : Resets the cumulative total. By default only today's (other days
-              are kept), or every day with --all.
-              Example: jiseishin.py clear / jiseishin.py clear --all
+  record          : Called from the Stop hook. Folds any transcript lines
+                    appended since the last update into the main session's
+                    per-message records.
+  check           : Called from the UserPromptSubmit hook. Blocks prompt
+                    submission with exit code 2 if today's cumulative total
+                    across all contexts is at or above the limit.
+  guard           : Called from the PostToolBatch hook (after each tool batch,
+                    before the next model call). Folds in the lines appended
+                    since the last call and stops the agentic loop with exit
+                    code 2 if today's total is at or above the limit, so a
+                    runaway loop is caught within the turn instead of only at
+                    the next prompt.
+  set-limit       : Saves the daily cost limit (USD) to the config file.
+                    Example: jiseishin.py set-limit 50
+  set-today-limit : Saves a per-day limit override (USD) for today. It applies
+                    to today only and self-expires (other days fall back to the
+                    base limit). Example: jiseishin.py set-today-limit 150
+  status          : Shows the cost for a given day (today by default) and the
+                    current limit. Example: jiseishin.py status 2026-06-18
+  clear           : Resets the cumulative total. By default only today's (other
+                    days are kept), or every day with --all.
+                    Example: jiseishin.py clear / jiseishin.py clear --all
 
 State has two parts, both keyed by <key> = the session_id for the main thread
 or "agent-<agent_id>" for a subagent (so each concurrent writer owns its files
@@ -53,8 +58,11 @@ timestamp keeps a session that spans midnight (or is resumed from an earlier
 day) from booking old cost on today. Because a copied message keeps its original
 timestamp, duplicates always fall on the same day, so per-day dedup suffices.
 
-The limit is resolved in the order "env var JISEISHIN_MAX_DAILY_COST_USD >
-config file > default". The config file can be updated with `set-limit`, and
+The limit for a day is resolved as "env var JISEISHIN_MAX_DAILY_COST_USD >
+per-day override (set with set-today-limit) for that day, if any > config file >
+default". The env var is a hard external ceiling and wins over everything; below
+it, the per-day override wins over the config base limit but only for its own
+date. The config file can be updated with `set-limit` / `set-today-limit`, and
 changes take effect from the next prompt (unlike the env var, no restart of
 Claude Code is needed).
 To avoid the guard itself making Claude unusable, any unexpected error in the
@@ -140,8 +148,33 @@ def read_config():
         return {}
 
 
-def limit():
-    """Resolve the limit (USD) in the order "env var > config file > default"."""
+def is_number(value):
+    """True for a real int/float (bool is excluded — it is an int subclass)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def daily_limit_override(date_str, config=None):
+    """Return the per-day limit override (USD) for date_str, or None if not set.
+
+    Overrides are stored in the config file under daily_limits (a map of
+    YYYY-MM-DD -> USD) by set-today-limit. They apply to their own date only, so
+    a day with no entry falls back to the base limit resolution."""
+    config = read_config() if config is None else config
+    overrides = config.get("daily_limits")
+    if isinstance(overrides, dict):
+        value = overrides.get(date_str)
+        if is_number(value) and value >= 0:
+            return float(value)
+    return None
+
+
+def limit(date=None):
+    """Resolve the effective limit (USD) for a day (today if date is None).
+
+    Order: "env var > per-day override (set-today-limit) for that day > config
+    file > default". The env var is a hard external ceiling and wins over
+    everything; below it, the per-day override wins over the config base limit
+    but only for its own date."""
     raw = os.environ.get("JISEISHIN_MAX_DAILY_COST_USD")
     if raw:
         try:
@@ -150,8 +183,12 @@ def limit():
                 return value
         except ValueError:
             pass
+    date_str = (date or datetime.date.today()).isoformat()
+    override = daily_limit_override(date_str)
+    if override is not None:
+        return override
     configured = read_config().get("max_daily_cost_usd")
-    if isinstance(configured, (int, float)) and not isinstance(configured, bool) and configured >= 0:
+    if is_number(configured) and configured >= 0:
         return float(configured)
     return DEFAULT_LIMIT_USD
 
@@ -447,7 +484,8 @@ def cmd_record(data):
 # means to raise the limit / reset the total / check status are left open
 # (blocking them would make it impossible to recover from hitting the limit).
 # Every other slash command and free-form prompt is subject to the limit.
-EXEMPT_COMMANDS = ("/jiseishin:set-limit", "/jiseishin:status", "/jiseishin:clear")
+EXEMPT_COMMANDS = ("/jiseishin:set-limit", "/jiseishin:set-today-limit",
+                   "/jiseishin:status", "/jiseishin:clear")
 
 
 def is_exempt(prompt):
@@ -464,7 +502,8 @@ def cmd_check(data):
         sys.stderr.write(
             f"[jiseishin] Daily cost limit reached: {fmt_usd(total)} / {fmt_usd(threshold)}.\n"
             "New prompt blocked. To continue, raise the limit with "
-            "/jiseishin:set-limit <USD>, or wait until the date changes.\n"
+            "/jiseishin:set-limit <USD> (or just for today with "
+            "/jiseishin:set-today-limit <USD>), or wait until the date changes.\n"
         )
         return 2
     return 0
@@ -494,7 +533,8 @@ def cmd_guard(data):
         sys.stderr.write(
             f"[jiseishin] Daily cost limit reached mid-turn: {fmt_usd(total)} / {fmt_usd(threshold)}.\n"
             "Stopping the agentic loop before the next model call. To continue, raise the "
-            "limit with /jiseishin:set-limit <USD>, reset with /jiseishin:clear, or wait "
+            "limit with /jiseishin:set-limit <USD> (or just for today with "
+            "/jiseishin:set-today-limit <USD>), reset with /jiseishin:clear, or wait "
             "until the date changes.\n"
         )
         return 2
@@ -523,6 +563,39 @@ def cmd_set_limit(args):
     return 0
 
 
+def cmd_set_today_limit(args):
+    """Save a per-day limit override for today (USD). Applies to today only and
+    self-expires: other days keep using the base limit. Past-day entries are
+    pruned on write so the config does not grow without bound."""
+    if not args:
+        sys.stderr.write("usage: jiseishin.py set-today-limit <usd>\n")
+        return 1
+    try:
+        value = float(args[0])
+    except ValueError:
+        sys.stderr.write(f"[jiseishin] Please specify a number (USD): {args[0]}\n")
+        return 1
+    if value < 0:
+        sys.stderr.write("[jiseishin] The limit must be 0 or greater.\n")
+        return 1
+    if value.is_integer():
+        value = int(value)
+    today = datetime.date.today().isoformat()
+    config = read_config()
+    overrides = config.get("daily_limits")
+    if not isinstance(overrides, dict):
+        overrides = {}
+    # Keep only today's (just set) and any future-dated entries; drop the past.
+    overrides = {date: usd for date, usd in overrides.items() if date >= today}
+    overrides[today] = value
+    config["daily_limits"] = overrides
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    atomic_write(CONFIG_PATH, json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    print(f"[jiseishin] Saved today's ({today}) limit = {value} ({fmt_usd(value)}). "
+          f"Applies to today only; other days use the base limit ({CONFIG_PATH})")
+    return 0
+
+
 def cmd_status(args):
     if args:
         try:
@@ -533,15 +606,18 @@ def cmd_status(args):
     else:
         date = datetime.date.today()
     total = date_cost(date)
-    threshold = limit()
+    threshold = limit(date)
     pct = (total / threshold * 100) if threshold else 0.0
     print(f"date          : {date.isoformat()}")
     print(f"total cost    : {fmt_usd(total)} / {fmt_usd(threshold)} ({pct:.1f}%)")
+    day_override = daily_limit_override(date.isoformat())
     env_override = os.environ.get("JISEISHIN_MAX_DAILY_COST_USD")
     configured = read_config().get("max_daily_cost_usd")
     if env_override:
         print(f"source        : env var JISEISHIN_MAX_DAILY_COST_USD={env_override}")
-    elif isinstance(configured, (int, float)) and not isinstance(configured, bool):
+    elif day_override is not None:
+        print(f"source        : per-day limit for {date.isoformat()} ({fmt_usd(day_override)}, set with set-today-limit)")
+    elif is_number(configured):
         print(f"source        : config file {CONFIG_PATH}")
     else:
         print(f"source        : default {fmt_usd(DEFAULT_LIMIT_USD)}")
@@ -603,6 +679,8 @@ def main():
     # terminal does not block).
     if mode == "set-limit":
         return cmd_set_limit(rest)
+    if mode == "set-today-limit":
+        return cmd_set_today_limit(rest)
     if mode == "status":
         return cmd_status(rest)
     if mode == "clear":

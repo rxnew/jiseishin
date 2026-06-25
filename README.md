@@ -27,29 +27,31 @@ Register the GitHub repository as a marketplace and install it:
 
 ## Configuration
 
-The limit is resolved in the order **env var > config file > default**. The default when unset is **$100/day**. This is a deliberately high circuit-breaker value to catch runaways in personal use; it is recommended to measure your actual usage for a few days with `/jiseishin:status`, then adjust it with `/jiseishin:set-limit` to fit your own numbers (e.g. about 1.2x your measured value).
+The limit for a day is resolved in the order **env var > per-day override (for that day) > config file > default**. The default when unset is **$100/day**. This is a deliberately high circuit-breaker value to catch runaways in personal use; it is recommended to measure your actual usage for a few days with `/jiseishin:status`, then adjust it with `/jiseishin:set-limit` to fit your own numbers (e.g. about 1.2x your measured value).
 
 ### Setting and checking the limit (skills / natural language)
 
 Use the bundled skills to set and check via conversation.
 
 ```
-/jiseishin:set-limit 50      # set the limit to $50/day
-/jiseishin:status            # check today's cost and limit
-/jiseishin:status yesterday  # check the cost and limit for a given day
-/jiseishin:clear             # delete today's state files (cumulative cost) to reset
-/jiseishin:clear --all       # delete state files for all days (disk cleanup)
+/jiseishin:set-limit 50         # set the base limit to $50/day
+/jiseishin:set-today-limit 200  # raise the limit for today only (reverts tomorrow)
+/jiseishin:status               # check today's cost and limit
+/jiseishin:status yesterday     # check the cost and limit for a given day
+/jiseishin:clear                # delete today's state files (cumulative cost) to reset
+/jiseishin:clear --all          # delete state files for all days (disk cleanup)
 ```
 
 In addition to slash commands, natural language also triggers them (the `set-limit` skill interprets the amount):
 
 - "Lower jiseishin's limit to 30 dollars" → `set-limit` skill
+- "Raise today's limit to 200" / "bump the cap just for today" → `set-today-limit` skill (today only; reverts to the base limit tomorrow)
 - "Check how much I spent today" / "How much did I spend yesterday?" → `status` skill (relative dates are converted to absolute dates before being passed)
 - "Reset jiseishin's usage" → `clear` skill
 
-The limit is saved in the config file `~/.config/jiseishin/config.json` (`{ "max_daily_cost_usd": <N> }`), and **changes take effect from the next prompt** (no restart of Claude Code needed).
+The base limit is saved in the config file `~/.config/jiseishin/config.json` (`{ "max_daily_cost_usd": <N> }`), per-day overrides under `daily_limits` (`{ "<YYYY-MM-DD>": <N> }`), and **changes take effect from the next prompt** (no restart of Claude Code needed). A per-day override applies to its date only, wins over the config base limit for that day (but the env var, if set, still takes priority over it), and self-expires (past entries are pruned when a new one is set).
 
-Note that the only three things not blocked while the limit is reached are `/jiseishin:set-limit`, `/jiseishin:status`, and `/jiseishin:clear`; every other slash command and other plugins' skills are also subject to the limit. Because these are exempted, **even after hitting the limit you can resume by raising it with `/jiseishin:set-limit` or resetting today's total with `/jiseishin:clear`**.
+Note that the only things not blocked while the limit is reached are `/jiseishin:set-limit`, `/jiseishin:set-today-limit`, `/jiseishin:status`, and `/jiseishin:clear`; every other slash command and other plugins' skills are also subject to the limit. Because these are exempted, **even after hitting the limit you can resume by raising it with `/jiseishin:set-limit` (or just for the day with `/jiseishin:set-today-limit`) or resetting today's total with `/jiseishin:clear`**.
 
 ### Temporary override (env var)
 

@@ -22,11 +22,11 @@ Set or change the jiseishin plugin's "daily cost limit (USD)". The cost is an es
 
 3. Briefly report the result (the save path and the configured value) to the user.
 
-If the user only asks to check usage, do not change the limit; use the status skill instead.
+If the user only asks to check usage, do not change the limit; use the status skill instead. If they want to raise the limit **for today only** (reverting to the normal limit tomorrow), use the set-today-limit skill instead.
 
 ## Notes
 
 - The limit is saved in the config file `~/.config/jiseishin/config.json` (key `max_daily_cost_usd`) and **takes effect from the next prompt** (no restart of Claude Code needed).
-- If the env var `JISEISHIN_MAX_DAILY_COST_USD` is set, it takes priority.
+- If the env var `JISEISHIN_MAX_DAILY_COST_USD` is set, it takes priority over everything. Below it, a per-day override set with set-today-limit takes priority over this base limit, but only for its own day. Resolution order: env var > per-day override > config file > default.
 - The default is $100/day (a deliberately high circuit-breaker value to catch runaways in personal use; it is recommended to measure your usage for a few days with status and adjust to fit your numbers).
 - Rates are specialized for the standard API rates (pay-as-you-go). Batch, priority tier, and subscription usage limits are out of scope.

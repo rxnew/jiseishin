@@ -34,6 +34,6 @@ rates         : Anthropic standard API rates (USD/MTok; batch/priority/subscript
 
 ## Notes
 
-- The limit (the right side of `/`) and the percentage are shown against the **current limit**. Per-day limits are not stored, so even for a past day the ratio is against the current limit, not the limit at that time.
+- The limit (the right side of `/`) and the percentage are shown against the **limit in effect for that day**: a per-day override (set with the set-today-limit skill) if one exists for that date, otherwise the current base limit (env var / config / default).
 - A day with no state files (no records) shows `$0.00`.
 - To change the limit, use the set-limit skill; to delete the cumulative total, use the clear skill.
